@@ -9,84 +9,114 @@ A ground-up CUDA implementation of softmax and scaled dot-product attention, opt
 | `softmax_naive.cu` | One thread per row — the obvious approach |
 | `softmax_optimized.cu` | One block per row, shared memory + warp shuffles |
 | `attention_baseline.cu` | Full attention: QK^T → softmax → V, step-by-step profiled |
-| `attention_flash.cu` | Flash Attention-style tiled kernel — coming soon |
+| `attention_flash.cu` | Flash Attention-style tiled kernel with online softmax |
 
 ## Benchmark Results
 
-### Softmax (1024 rows)
+### Softmax (1024 rows, NVIDIA T4)
 
 | Version | SEQ_LEN | Bandwidth | Speedup |
 |---------|---------|-----------|---------|
-| Naive | 512 | 4.80 GB/s | 1× |
-| Optimized | 512 | 109.85 GB/s | **22.9×** |
+| Naive (1 thread/row) | 512 | 4.80 GB/s | 1× |
+| Optimized (shared mem + warp shuffle) | 512 | 109.85 GB/s | **22.9×** |
 | Optimized | 1024 | 125.95 GB/s | **26.2×** |
 
-GPU: NVIDIA T4 (peak ~300 GB/s)
+Peak bandwidth on T4: ~300 GB/s
 
-### Attention Baseline (d_k=64, d_v=64)
+### Attention Baseline — Per-Step Profiling (d_k=64, d_v=64)
 
-| SEQ_LEN | Total Time | S Matrix | QK^T | Softmax | PV |
-|---------|-----------|----------|------|---------|-----|
+| SEQ_LEN | Total | S matrix | QK^T | Softmax | PV |
+|---------|-------|----------|------|---------|-----|
 | 64 | 0.025 ms | 0.02 MB | 0.008 ms | 0.005 ms | 0.008 ms |
 | 128 | 0.031 ms | 0.06 MB | 0.012 ms | 0.005 ms | 0.011 ms |
 | 256 | 0.060 ms | 0.25 MB | 0.024 ms | 0.011 ms | 0.022 ms |
 | 512 | 0.175 ms | 1.00 MB | 0.078 ms | 0.020 ms | 0.070 ms |
 
-At SEQ_LEN=4096 the S matrix alone would be **64 MB per head**. That's the problem Flash Attention solves.
+At SEQ_LEN=512, the two GEMMs (QK^T + PV) account for 85% of runtime.
+At SEQ_LEN=4096, the S matrix alone would be **64 MB per head**.
 
-## The optimization story
+### Flash Attention vs Baseline (SEQ_LEN=1024, d_k=64)
 
-### Softmax: 4.8 → 110 GB/s
+| Kernel | Time | HBM Traffic | Speedup |
+|--------|------|-------------|---------|
+| Baseline (4-kernel pipeline) | 0.577 ms | 17.00 MB | 1× |
+| Flash Attention V3 | 2.317 ms | 0.75 MB | 0.25× |
 
-The naive kernel assigns one thread per row. With 1024 rows and 256 threads/block, only 4 blocks run — leaving 36 of the T4's 40 SMs completely idle. Every memory access hits global DRAM.
+**HBM traffic reduction: 22.67×** — Flash never writes the S or P matrices to DRAM.
 
-The optimized kernel flips the model: one block per row, 512 threads collaborate using shared memory and warp-level shuffle reductions. The row loads into on-chip SRAM once. All reductions happen there. Result: 22.9× faster.
+The Flash kernel is slower at SEQ_LEN=1024 on a T4 because the baseline's
+S matrix (4MB) still fits in L2 cache, so DRAM traffic isn't actually the
+bottleneck. Flash Attention's advantage grows with sequence length — at
+SEQ_LEN=4096, S is 64MB and genuinely can't be cached, which is exactly the
+regime the original paper targets.
+
+## The Optimization Story
+
+### Softmax: 4.8 → 110 GB/s (22.9×)
+
+The naive kernel assigns one thread per row. With 1024 rows and 256 threads/block,
+only 4 blocks run — leaving 36 of the T4's 40 SMs completely idle.
+Every memory access hits global DRAM at ~600 cycle latency.
+
+The optimized kernel flips the model: one block per row, 512 threads collaborate
+using shared memory and warp-level shuffle reductions. The row loads into on-chip
+SRAM once. All reductions happen there.
 
 Key techniques:
-- `__shared__` memory for on-chip storage (~5 cycle latency vs ~600 for DRAM)
-- `__syncthreads()` barriers to coordinate threads safely
-- `__shfl_down_sync()` for warp-level parallel reduction in O(log N) steps
+- `__shared__` memory: ~5 cycle latency vs ~600 for DRAM
+- `__syncthreads()`: barrier to coordinate shared memory safely
+- `__shfl_down_sync()`: warp-level parallel reduction in O(log N) steps
 - Numerically stable softmax: subtract row max before exp to prevent overflow
 
-### Attention: why it gets expensive
+### Attention Baseline: O(N²) memory growth
 
-Attention is O(N²) in both compute and memory. The score matrix S = QK^T is N×N — at SEQ_LEN=512 that's 1MB. At SEQ_LEN=4096 it's 64MB per head. Writing and reading this matrix from DRAM on every forward pass is the bottleneck.
+Per-step profiling at SEQ_LEN=512 shows the GEMMs dominate (85% of runtime)
+because both QK^T and PV read/write the full N×N score matrix through DRAM.
+Doubling SEQ_LEN roughly triples runtime — the O(N²) cost showing up in practice.
 
-Per-step profiling at SEQ_LEN=512:
-- QK^T GEMM: 45% of runtime
-- PV GEMM: 40% of runtime  
-- Softmax: 12% of runtime
-- Scale: 3% of runtime
+### Flash Attention: online softmax + tiled computation
 
-The GEMMs dominate because they're both reading and writing the full N×N matrix through global memory.
+Flash Attention (Dao et al., 2022) processes Q, K, V in tiles that fit in
+shared memory, using the online softmax algorithm to accumulate correct output
+without ever materializing the full S matrix.
 
-### Flash Attention: never materialize S
+This implementation uses a 2D thread block (Br=16, Bc=32, 512 threads/block)
+where thread (ty, tx) computes score S[ty][tx] = dot(Q[ty], K[tx]) in parallel
+with all other threads, then collaborates on the online softmax update.
 
-Flash Attention (Dao et al., 2022) tiles the computation so Q, K, V are processed in blocks that fit in shared memory. S is never written to DRAM. This reduces memory complexity from O(N²) to O(N) and cuts memory bandwidth requirements dramatically — especially important for long sequences.
+The key identity that makes online softmax work: given running max m and
+normalizer l, when new scores arrive with tile max m_new:
+```
+alpha   = exp(m - m_new)       // correction for old accumulator
+l_new   = alpha * l + sum(exp(scores - m_new))
+O_new   = alpha * O + exp(scores - m_new) * V_tile
+m       = m_new
+```
+At the end, O / l gives the correct softmax-weighted output — with S never
+written to memory at any sequence length.
 
-## How to run
+## How to Run
 
-**On Google Colab (recommended — free T4 GPU):**
+**Google Colab (recommended — free T4 GPU):**
 
 ```python
-# Cell 1
-%%writefile softmax_naive.cu
-# paste file contents
+%%writefile attention_flash.cu
+# paste file contents here
 
-# Cell 2
-!nvcc -O2 -o softmax_naive softmax_naive.cu && ./softmax_naive
+!nvcc -O2 -o attention_flash attention_flash.cu && ./attention_flash
 ```
 
 **Locally (requires NVIDIA GPU + CUDA Toolkit):**
 
 ```bash
-nvcc -O2 -o softmax_naive softmax_naive.cu && ./softmax_naive
-nvcc -O2 -o softmax_optimized softmax_optimized.cu && ./softmax_optimized
-nvcc -O2 -o attention_baseline attention_baseline.cu && ./attention_baseline
+nvcc -O2 -o softmax_naive      softmax_naive.cu      && ./softmax_naive
+nvcc -O2 -o softmax_optimized  softmax_optimized.cu  && ./softmax_optimized
+nvcc -O2 -o attention_baseline attention_baseline.cu  && ./attention_baseline
+nvcc -O2 -o attention_flash    attention_flash.cu     && ./attention_flash
 ```
 
 ## References
 
-- [Flash Attention paper (Dao et al., 2022)](https://arxiv.org/abs/2205.14135)
+- [Flash Attention (Dao et al., 2022)](https://arxiv.org/abs/2205.14135)
+- [Online normalizer calculation for softmax (Milakov & Gimelshein, 2018)](https://arxiv.org/abs/1805.02867)
 - [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
-- [Online softmax (Milakov & Gimelshein, 2018)](https://arxiv.org/abs/1805.02867)
