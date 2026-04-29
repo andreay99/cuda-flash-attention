@@ -1,0 +1,26 @@
+# Compiled binaries
+softmax_naive
+softmax_optimized
+attention_baseline
+attention_flash
+
+# Object files
+*.o
+*.obj
+
+# CUDA intermediate files
+*.ptx
+*.cubin
+*.fatbin
+
+# macOS
+.DS_Store
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+
+# Colab checkpoints
+.ipynb_checkpoints/
+*.ipynb
