@@ -1,6 +1,6 @@
 # CUDA Softmax & Flash Attention
 
-A ground-up CUDA implementation of softmax and scaled dot-product attention, optimized step by step and benchmarked at each stage. Built to understand how modern GPU kernels work and why Flash Attention exists.
+A ground-up CUDA implementation of softmax and scaled dot-product attention, optimized step by step and benchmarked at each stage. Culminates in a raw CUDA implementation of the Flash Attention backward pass — including gradient recomputation from saved statistics, without ever materializing the full N×N score matrix.
 
 ## What's in here
 
@@ -10,6 +10,8 @@ A ground-up CUDA implementation of softmax and scaled dot-product attention, opt
 | `softmax_optimized.cu` | One block per row, shared memory + warp shuffles |
 | `attention_baseline.cu` | Full attention: QK^T → softmax → V, step-by-step profiled |
 | `attention_flash.cu` | Flash Attention-style tiled kernel with online softmax |
+| `flash_attention_backward.cu` | Flash Attention forward + full backward pass in raw CUDA |
+| `verify_gradients.py` | Verifies CUDA gradients against PyTorch autograd |
 
 ## Benchmark Results
 
@@ -49,6 +51,20 @@ S matrix (4MB) still fits in L2 cache, so DRAM traffic isn't actually the
 bottleneck. Flash Attention's advantage grows with sequence length — at
 SEQ_LEN=4096, S is 64MB and genuinely can't be cached, which is exactly the
 regime the original paper targets.
+
+### Flash Attention Backward — Gradient Verification (SEQ_LEN=256, d=64)
+
+All gradients verified against CPU reference (float32):
+
+| Gradient | Max error vs CPU | Status |
+|----------|-----------------|--------|
+| Forward O | 9.69e-08 | PASSED |
+| dV | 3.58e-07 | PASSED |
+| dQ | 4.47e-08 | PASSED |
+| dK | 1.19e-07 | PASSED |
+
+Errors are at the level of float32 rounding noise (~1e-7). The backward pass
+never stores the N×N attention matrix — P is recomputed from saved m and l.
 
 ## The Optimization Story
 
@@ -95,15 +111,41 @@ m       = m_new
 At the end, O / l gives the correct softmax-weighted output — with S never
 written to memory at any sequence length.
 
+### Flash Attention Backward: recomputation instead of storage
+
+Standard attention backward requires storing the full N×N softmax matrix P
+from the forward pass, then reading it back to compute gradients — O(N²) memory.
+
+The Flash Attention backward pass avoids this entirely. The forward pass saves
+only two vectors: m[N] (per-row softmax max) and l[N] (per-row normalizer).
+During backward, each P tile is recomputed on-the-fly from Q, K, m, and l:
+
+```
+P[i][j] = exp(S[i][j] - m[i]) / l[i]
+```
+
+Gradients follow from the softmax backward identity. Given D[i] = dot(dO[i], O[i]):
+
+```
+dS[i][j] = P[i][j] * (dP[i][j] - D[i])    where dP[i][j] = dot(dO[i], V[j])
+dV[j]    = sum_i P[i][j] * dO[i]
+dQ[i]    = sum_j dS[i][j] * K[j] / sqrt(d)
+dK[j]    = sum_i dS[i][j] * Q[i] / sqrt(d)
+```
+
+The N×N score matrix is never written to memory at any point in forward or backward.
+Memory stays O(N·d) throughout — the key property that makes Flash Attention
+practical at large sequence lengths.
+
 ## How to Run
 
 **Google Colab (recommended — free T4 GPU):**
 
 ```python
-%%writefile attention_flash.cu
+%%writefile flash_attention_backward.cu
 # paste file contents here
 
-!nvcc -O2 -o attention_flash attention_flash.cu && ./attention_flash
+!nvcc -O2 -o flash_backward_bin flash_attention_backward.cu && ./flash_backward_bin
 ```
 
 **Locally (requires NVIDIA GPU + CUDA Toolkit):**
@@ -113,6 +155,7 @@ nvcc -O2 -o softmax_naive      softmax_naive.cu      && ./softmax_naive
 nvcc -O2 -o softmax_optimized  softmax_optimized.cu  && ./softmax_optimized
 nvcc -O2 -o attention_baseline attention_baseline.cu  && ./attention_baseline
 nvcc -O2 -o attention_flash    attention_flash.cu     && ./attention_flash
+nvcc -O2 -o flash_backward_bin flash_attention_backward.cu && ./flash_backward_bin
 ```
 
 ## References
