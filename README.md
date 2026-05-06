@@ -66,6 +66,10 @@ All gradients verified against CPU reference (float32):
 Errors are at the level of float32 rounding noise (~1e-7). The backward pass
 never stores the N×N attention matrix — P is recomputed from saved m and l.
 
+## Why This Matters
+
+Modern large language models use attention across hundreds or thousands of tokens. At SEQ_LEN=4096, the standard attention score matrix is **64MB per head**. A model with 32 attention heads running on 8 GPUs needs **16GB just for the attention matrices** — before weights, activations, or gradients. Flash Attention reduces attention memory from O(N²) to O(N·d), which is what makes long-context models like GPT-4 (128k tokens) and Claude (200k tokens) practical at all. The backward pass is the harder half: most open-source student implementations stop at the forward pass because storing and differentiating through the recomputation requires careful math. This project implements the full training loop — forward and backward — entirely in raw CUDA, with no PyTorch autograd, no CuPy, no high-level wrappers.
+
 ## The Optimization Story
 
 ### Softmax: 4.8 → 110 GB/s (22.9×)
